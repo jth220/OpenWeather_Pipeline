@@ -102,4 +102,3 @@ This project is for learning purposes, but PRs and issues are welcome.
 
 ---
 
-⚠️ **Note:** Never commit your `settings.env` with real secrets. Always use `.gitignore` and commit only the `settings.env.example`.
