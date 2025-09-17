@@ -1,0 +1,13 @@
+{"base":"stations",
+"clouds":{"all":20},
+"cod":200,
+"coord":{"lat":51.5085,"lon":-0.1257},
+"dt":1756980872,
+"id":2643743,
+"main":{"feels_like":16.64,"grnd_level":1000,"humidity":79,"pressure":1004,"sea_level":1004,"temp":15.84,"temp_max":18.36,"temp_min":15.06},
+"name":"London",
+"sys":{"country":"GB","id":2075535,"sunrise":1756963088,"sunset":1757011280,"type":2},
+"timezone":3600,
+"visibility":10000,
+"weather":[{"description":"few clouds","icon":"02d","id":801,"main":"Clouds"}],
+"wind":{"deg":200,"speed":4.12}}

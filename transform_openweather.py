@@ -186,18 +186,16 @@ Side Effects:
   - None. Pure transformation.
 """
 
- if payload.get("id") is None or payload.get("dt") is None: #Check for missing natural key
-  return None #Quarantine here upstream will quarantine, whatever the fuck that means
  try:
-   id, dt = int(payload.get("id")), int(payload.get("dt"))
-
- except (KeyError, TypeError, ValueError):
-   return None
+    city_id = int(payload["id"])
+    dt = int(payload["dt"])
+except (KeyError, TypeError, ValueError): #Checks for missing id and dt
+    return None #Upstream quarantine from here
  
  ts_utc = datetime.fromtimestamp(dt, timezone.utc) #Converts unix timestamp to a datetime object in UTC
- ts_utc_date, ts_utc_HR = ts_utc.strftime("%d/%m/%Y"), ts_utc.strftime("%H") #Derives a date and an hour of retrieval (variable is now a string)
+ ts_utc_date, ts_utc_HR = ts_utc.date().isoformat(), ts_utc.hour  #Derives a date and an hour of retrieval
  
- raw_key = (f"owm:{id}:{dt}") #
+ raw_key = (f"owm:{city_id}:{dt}") #
  event_id_hex24 = hashlib.sha1(raw_key.encode()).hexdigest()[:24]
 
  # --- Safe sub-dicts --- Extract these from the json file
@@ -250,7 +248,7 @@ Side Effects:
  row = {
     # Keys & provenance
     "event_id": event_id_hex24,
-    "city_id": id,
+    "city_id": city_id,
     "city_slug": city_slug,
     "city_name": city_name,
     "event_ts_utc": ts_utc,
