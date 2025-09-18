@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import hashlib
-
+import json
+from json import JSONDecodeError
 
 
 
@@ -295,14 +296,14 @@ except (KeyError, TypeError, ValueError): #Checks for missing id and dt
 
 
 def validate(row):
- return None
-"""
-Apply Silver validation rules to a single normalized row.
 
-Args:
+ """
+ Apply Silver validation rules to a single normalized row.
+
+ Args:
   row (dict): A normalized Silver-shaped row (from `normalize`).
 
-Returns:
+ Returns:
   tuple[dict, list[str], str]:
     - fixed_row: The row after applying nullifications/caps for non-critical
                  violations (do not silently cap unless the contract allows it;
@@ -310,7 +311,7 @@ Returns:
     - flags: List of quality flags applied to the row (strings).
     - verdict: One of {"pass", "quarantine"} indicating promotion eligibility.
 
-Validation Semantics:
+ Validation Semantics:
   - Critical failures (e.g., missing event_ts_utc, temp_c, or nonsensical time)
     → verdict="quarantine".
   - Non-critical range violations → set offending field to NULL and append a
@@ -318,19 +319,145 @@ Validation Semantics:
   - Negative accumulations (rain_1h_mm, snow_1h_mm) → quarantine.
   - Lat/Lon policy: either quarantine or null+flag, per contract decision.
 
-Invariants:
+ Invariants:
   - Primary key fields (city_id, event_ts_utc) must be present on "pass".
   - date_utc and hour_utc must be consistent with event_ts_utc.
 
-Side Effects:
+ Side Effects:
   - None. Pure function.
 
-Examples of Flags:
+ Examples of Flags:
   - "humidity_out_of_range"
   - "visibility_suspicious_high"
   - "latlon_out_of_range"
-"""
+ """
+ fixed = dict(row)  # shallow copy, however during critical, use the actual row for quick bails, otherwise for non critical check we use copies to safely mutate.
+ flags = []
 
+    # --- Critical checks ---
+ if row.get("city_id") is None or row.get("event_ts_utc") is None: #Checks for every critical fields
+        flags.append("missing_event_ts_utc_or_city_id")
+        return fixed, flags, "quarantine" #Returns immediately if checks failso 
+
+ if row.get("temp_c") is None:
+        flags.append("missing_temp_c")
+        return fixed, flags, "quarantine"
+
+ if not isinstance(row["event_ts_utc"], datetime):
+        flags.append("event_ts_not_datetime")
+        return fixed, flags, "quarantine"
+
+ if row["event_ts_utc"] < datetime(2000,1,1,tzinfo=timezone.utc): #Rule violation checks
+        flags.append("event_ts_too_old")
+        return fixed, flags, "quarantine"
+
+    # continue with non-critical checks...
+    #Temperature
+ for f in ("temp_c", "feels_like_c", "temp_min_c", "temp_max_c"):
+      v = fixed.get(f)
+      if v is not None:
+        if not isinstance(v, (int, float)):
+          flags.append(f"{f}_is_not_numeric")
+          fixed[f] = None
+
+        elif not (-80<= v <=65):
+          flags.append(f"{f}_is_out_of_range")
+          fixed[f] = None
+
+    # Pressure
+ v = fixed.get("pressure_hpa")
+ if v is not None:
+     if not isinstance(v, (int, float)):
+        flags.append("pressure_hpa_not_numeric")
+        fixed["pressure_hpa"] = None
+     elif not (850 <= v <= 1100):
+        flags.append("pressure_hpa_out_of_range")
+        fixed["pressure_hpa"] = None
+
+    # Humidity
+ v = fixed.get("humidity_pct")
+ if v is not None:
+     if not isinstance(v, (int, float)):
+        flags.append("humidity_pct_not_numeric")
+        fixed["humidity_pct"] = None
+     elif not (0 <= v <= 100):
+        flags.append("humidity_pct_out_of_range")
+        fixed["humidity_pct"] = None
+
+    # Wind speeds (speed, gust >= 0)
+ for f in ("wind_speed_ms", "wind_gust_ms"):
+     v = fixed.get(f)
+     if v is None:
+        continue
+     if not isinstance(v, (int, float)):
+        flags.append(f"{f}_not_numeric")
+        fixed[f] = None
+     elif v < 0:
+        flags.append(f"{f}_negative")
+        fixed[f] = None
+
+    # Wind direction (0–360)
+ v = fixed.get("wind_deg")
+ if v is not None:
+     if not isinstance(v, (int, float)):
+        flags.append("wind_deg_not_numeric")
+        fixed["wind_deg"] = None
+     elif not (0 <= v <= 360):
+        flags.append("wind_deg_out_of_range")
+        fixed["wind_deg"] = None
+
+    # Clouds
+ v = fixed.get("clouds_pct")
+ if v is not None:
+      if not isinstance(v, (int, float)):
+        flags.append("clouds_pct_not_numeric")
+        fixed["clouds_pct"] = None
+      elif not (0 <= v <= 100):
+        flags.append("clouds_pct_out_of_range")
+        fixed["clouds_pct"] = None
+
+    # Visibility
+ v = fixed.get("visibility_m")
+ if v is not None:
+     if not isinstance(v, (int, float)):
+        flags.append("visibility_m_not_numeric")
+        fixed["visibility_m"] = None
+     elif v < 0:
+        flags.append("visibility_m_negative")
+        fixed["visibility_m"] = None
+     elif v > 20000:
+        flags.append("visibility_m_suspicious_high")
+
+     # Precip accumulations
+ for f in ("rain_1h_mm", "snow_1h_mm"):
+  v = fixed.get(f)
+  if v is None:
+        continue
+  if not isinstance(v, (int, float)):
+        flags.append(f"{f}_not_numeric")
+        fixed[f] = None
+  elif v < 0:
+        flags.append(f"{f}_negative")
+        return fixed, flags, "quarantine"
+
+      # Geo
+ lat, lon = fixed.get("lat"), fixed.get("lon")
+
+ bad_lat = (lat is not None) and (not isinstance(lat, (int, float)) or not (-90 <= lat <= 90))
+ bad_lon = (lon is not None) and (not isinstance(lon, (int, float)) or not (-180 <= lon <= 180))
+
+ if bad_lat:
+       fixed["lat"] = None
+       flags.append("latlon_out_of_range")
+
+ if bad_lon:
+       fixed["lon"] = None
+       if "latlon_out_of_range" not in flags:
+        flags.append("latlon_out_of_range")
+
+
+ fixed["quality_flags"] = ";".join(flags) if flags else ""
+ return fixed, flags, "pass"
 
 """
 Persist an invalid or rejected record into a quarantine area for audit.
@@ -365,31 +492,150 @@ Notes:
 """
 
 
-"""
-Enforce uniqueness on (city_id, event_ts_utc) and mark conflicts.
+def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_key:str , checksum_sha256:str , dedup_policy:str) -> tuple[list[dict], list[dict], list[dict]]:
+ """
+    Orchestrate a micro-batch from Bronze → Silver:
+      JSONL lines (raw provider payloads) → normalize → validate → deduplicate.
 
-Args:
+    Inputs:
+      bronze_lines:
+        List of raw JSON strings. Each line should be one OpenWeather payload
+        exactly as stored in Bronze (compact JSON per line).
+      city_slug:
+        Canonical city partition (e.g., "london"). Passed through to normalize().
+      bronze_key:
+        The S3 object key these lines came from (provenance).
+      checksum_sha256:
+        SHA-256 of the Bronze object (provenance). Same for all lines in this batch.
+      dedup_policy:
+        Deduplication policy; currently supports:
+          - "last_write_wins": keep the row with the greatest ingested_at_utc,
+            then break ties deterministically by (checksum_sha256, bronze_object_key, event_id).
+
+    Returns:
+      survivors:
+        List of validated + deduplicated Silver rows. Exactly one per natural key
+        (city_id, event_ts_utc). If a key had multiple candidates with differing
+        content fingerprints, the survivor will have conflict=True and will include
+        a 'duplicate_conflict' quality flag (appended to any existing flags).
+      dups_meta:
+        List of metadata records about dropped duplicates. Each item is:
+          {
+            "key": (city_id, event_ts_utc_iso),
+            "survivor_event_id": str,
+            "dropped_event_id": str,
+            "reason": "identical" | "conflict",
+            "policy": dedup_policy
+          }
+      rejected:
+        List of rejects that did not pass validation. Each item is:
+          {
+            "reason": "missing_natural_key" | "validation_failed",
+            "flags": list[str],
+            "payload": dict,                 # the original provider payload
+            "bronze_object_key": bronze_key,
+            "checksum_sha256": checksum_sha256
+          }
+
+    Semantics:
+      - normalize() may return None → treat as rejected with reason="missing_natural_key".
+      - validate() returns (fixed, flags, verdict):
+          • verdict="quarantine" → push to rejected with reason="validation_failed".
+          • verdict="pass" → include 'fixed' row in candidate set.
+      - deduplicate() runs over all passing rows, grouped by (city_id, event_ts_utc).
+        • Identical fingerprints → keep one, others recorded as reason="identical".
+        • Differing fingerprints → keep per policy, survivor.conflict=True and add
+          "duplicate_conflict" to survivor's quality flags; dropped as reason="conflict".
+
+    Invariants (assertions recommended post-run):
+      - No two survivors share the same (city_id, event_ts_utc).
+      - Every rejected record has a non-empty 'reason'.
+      - Every dups_meta item references an actual survivor_event_id.
+
+    Notes:
+      - This function performs no I/O writes; it is pure orchestration over in-memory inputs.
+      - Use logging to emit a one-line summary: processed, passed, rejected, groups, duplicates, conflicts.
+  """
+  candidates: list[dict] = []
+rejected:   list[dict] = []
+dups_meta:  list[dict] = []
+
+for raw_json in bronze_lines:
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        rejected.append({
+            "reason": "malformed_json",
+            "flags": [],
+            "payload_raw": raw_json,
+            "bronze_object_key": bronze_key,
+            "checksum_sha256": checksum_sha256,
+        })
+        continue  # skip to next line
+
+    
+    row = normalize(
+        payload,
+        city_slug=city_slug,
+        bronze_key=bronze_key,
+        checksum_sha256=checksum_sha256,
+    )
+    if row is None:
+        rejected.append({
+            "reason": "missing_natural_key",
+            "flags": [],
+            "payload_raw": payload,  # inspect parsed payload
+            "bronze_object_key": bronze_key,
+            "checksum_sha256": checksum_sha256,
+        })
+        continue
+
+    fixed, flags, verdict = validate(row)
+    if verdict == "quarantine":
+        rejected.append({
+            "reason": "validation_failed",
+            "flags": flags,
+            "payload_raw": row,  # inspect normalized row
+            "bronze_object_key": bronze_key,
+            "checksum_sha256": checksum_sha256,
+        })
+        continue
+
+    # only reached if not quarantined
+    candidates.append(fixed)
+
+
+def compute_fingerprint() #To detect conflicting measurements in duplicated records, hash the analytical fields (provenance excluding) and act based on policies
+
+
+def deduplicate(rows, *, policy="last_write_wins", fingerprint_fields=None) -> tuple[list[dict], list[dict]]:
+ """
+ Enforce uniqueness on (city_id, event_ts_utc) and mark conflicts.
+
+ Args:
   rows (list[dict]): Validated rows with consistent primary keys.
   policy (str): Conflict resolution strategy:
                 - "last": keep the lexicographically/latest row by a stable
                           tiebreaker (e.g., bronze_object_key or ingestion time).
                 - "first": keep the earliest row by the same tiebreaker.
 
-Returns:
+ Returns:
   list[dict]: Deduplicated rows. For any PK with >1 candidates, the retained
               row has `conflict=True` if the dropped competitor(s) had any
               differing non-provenance fields; otherwise `conflict=False`.
 
-Determinism:
+ Determinism:
   - Deterministic given the tiebreaker and input order normalization.
 
-Side Effects:
+ Side Effects:
   - None.
 
-Notes:
+ Notes:
   - Caller must define and document the tiebreaker used (e.g., bronze key or
     manifest timestamp) and keep it consistent across runs.
-"""
+ """
+
+ key = (rows["city_id"], rows["event_ts_utc"]) #gives you a list of city_id and event_ts_utc, this checks for duplicates
 
 
 """""
@@ -412,7 +658,7 @@ Returns:
           "deduped": int,
           "written_rows": int,
           "partitions": int,
-          "quarantine_rate": float,  # 0.0–1.0
+          "quarantine_rate": float,  # 0.0-1.0
           "policy": { "dedup": "last", "partitioning": "date|date_hour" }
         }
 
