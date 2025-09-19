@@ -605,8 +605,45 @@ for raw_json in bronze_lines:
     candidates.append(fixed)
 
 
-def compute_fingerprint() #To detect conflicting measurements in duplicated records, hash the analytical fields (provenance excluding) and act based on policies
+def compute_fingerprint(row) #To detect conflicting measurements in duplicated records, hash the analytical fields (provenance excluding) and act based on policies
+ FINGERPRINT_FIELDS = (
+    # Temperatures
+    "temp_c",
+    "feels_like_c",
+    "temp_min_c",
+    "temp_max_c",
 
+    # Atmosphere
+    "pressure_hpa",
+    "humidity_pct",
+
+    # Wind
+    "wind_speed_ms",
+    "wind_deg",
+    "wind_gust_ms",
+
+    # Sky / visibility
+    "clouds_pct",
+    "visibility_m",
+
+    # Precipitation
+    "rain_1h_mm",
+    "snow_1h_mm",
+
+    # Weather descriptors
+    "weather_code",
+    "weather_main",
+    "weather_desc",
+
+    # Geo
+    "lat",
+    "lon",
+    "timezone_offset_s",
+)
+ content = {f : row.get(f) for f in FINGERPRINT_FIELDS}#dictionary comprehension to retrieve all analytical fields (provenance excusive)
+ blob = json.dumps(content, sort_keys=True, separators=(",",":")) #Lays it all out as one single line, seperators are changed so that there is no spaces, its as compact as it gets
+ return sha256(blob.encode("utf-8")).hexdigest()
+ 
 
 def deduplicate(rows, *, policy="last_write_wins", fingerprint_fields=None) -> tuple[list[dict], list[dict]]:
  """
@@ -634,9 +671,14 @@ def deduplicate(rows, *, policy="last_write_wins", fingerprint_fields=None) -> t
   - Caller must define and document the tiebreaker used (e.g., bronze key or
     manifest timestamp) and keep it consistent across runs.
  """
+ groups : defaultdict(list)
+ for row in rows: 
+  key = (row["city_id"], row["event_ts_utc"]) #gives you a tuple of city_id and event_ts_utc, this checks for duplicates
+  groups[key].append(row) #assign keys (given by variable above) and append that row
 
- key = (rows["city_id"], rows["event_ts_utc"]) #gives you a list of city_id and event_ts_utc, this checks for duplicates
-
+ for key, item in groups.items():
+#To finish
+  
 
 """""
 End-to-end orchestration for promoting Bronze → Silver for one city-date.
