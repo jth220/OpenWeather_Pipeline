@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from json import JSONDecodeError
-
+from collections import defaultdict
 
 
 
@@ -59,7 +59,7 @@ Geo & Time:
 - lon: float
 - timezone_offset_s: int | null
 - date_utc: date  (derived from event_ts_utc)
-- hour_utc: int   (0–23; optional partition)
+- hour_utc: int   (0-23; optional partition)
 
 Validation Rules
 ----------------
@@ -150,17 +150,17 @@ Observability:
 """
 
 
-def normalize(payload, *, city_slug, bronze_key, checksum_sha256):
+def normalize(payload, *, city_slug, bronze_object_key, checksum_sha256):
  """
-Map a raw OpenWeather payload into a Silver row (no validation yet).
+ Map a raw OpenWeather payload into a Silver row (no validation yet).
 
-Args:
+ Args:
   payload (dict): Single OpenWeather "current weather" JSON object.
   city_slug (str): Canonical city slug for partitioning.
   bronze_key (str): Source Bronze object key (provenance).
   checksum_sha256 (str): Hex digest of the Bronze object bytes.
 
-Returns:
+ Returns:
   dict | None: A single Silver-shaped row with all expected columns,
                including partitions and provenance. Returns None if the
                payload lacks natural key fields required to derive:
@@ -169,7 +169,7 @@ Returns:
                In this case, caller should quarantine with reason
                "missing_natural_key".
 
-Columns Populated:
+ Columns Populated:
   - event_id derived deterministically from (provider, city_id, dt)
   - city_id, city_slug, city_name (title-cased if present)
   - event_ts_utc (tz-aware UTC)
@@ -180,17 +180,17 @@ Columns Populated:
   - quality_flags initialized empty
   - conflict initialized False
 
-Determinism:
+ Determinism:
   - Given identical payload, city_slug, bronze_key, checksum → identical row.
 
-Side Effects:
+ Side Effects:
   - None. Pure transformation.
-"""
+ """
 
  try:
     city_id = int(payload["id"])
     dt = int(payload["dt"])
-except (KeyError, TypeError, ValueError): #Checks for missing id and dt
+ except (KeyError, TypeError, ValueError): #Checks for missing id and dt
     return None #Upstream quarantine from here
  
  ts_utc = datetime.fromtimestamp(dt, timezone.utc) #Converts unix timestamp to a datetime object in UTC
@@ -207,16 +207,16 @@ except (KeyError, TypeError, ValueError): #Checks for missing id and dt
  snow = payload.get("snow", {})
  weather_list = payload.get("weather", [])
 
-# --- Geo / time ---
+  #--- Geo / time ---
  lat = payload.get("coord", {}).get("lat")
  lon = payload.get("coord", {}).get("lon")
  timezone_offset_s = payload.get("timezone")
 
-# --- City naming ---
+ # --- City naming ---
  city_name = payload.get("name")
-# city_slug comes from the function arg
+ # city_slug comes from the function arg
 
-# --- Main block ---
+ # --- Main block ---
  temp_c = main.get("temp")
  feels_like_c = main.get("feels_like")
  temp_min_c = main.get("temp_min")
@@ -224,18 +224,18 @@ except (KeyError, TypeError, ValueError): #Checks for missing id and dt
  pressure_hpa = main.get("pressure")
  humidity_pct = main.get("humidity")
 
-# --- Wind ---
+ # --- Wind ---
  wind_speed_ms = wind.get("speed")
  wind_deg = wind.get("deg")
  wind_gust_ms = wind.get("gust")
 
-# --- Clouds / visibility / precip ---
+ # --- Clouds / visibility / precip ---
  clouds_pct = clouds.get("all")
  visibility_m = payload.get("visibility")
  rain_1h_mm = rain.get("1h")
  snow_1h_mm = snow.get("1h")
 
-# --- Weather descriptor (first element only) ---
+ # --- Weather descriptor (first element only) ---
  if weather_list:
     weather_code = weather_list[0].get("id")
     weather_main = weather_list[0].get("main")
@@ -556,14 +556,14 @@ def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_key:str ,
       - This function performs no I/O writes; it is pure orchestration over in-memory inputs.
       - Use logging to emit a one-line summary: processed, passed, rejected, groups, duplicates, conflicts.
   """
-  candidates: list[dict] = []
-rejected:   list[dict] = []
-dups_meta:  list[dict] = []
+ candidates: list[dict] = []
+ rejected:   list[dict] = []
+ dups_meta:  list[dict] = []
 
-for raw_json in bronze_lines:
+ for raw_json in bronze_lines:
     try:
         payload = json.loads(raw_json)
-    except json.JSONDecodeError:
+    except JSONDecodeError:
         rejected.append({
             "reason": "malformed_json",
             "flags": [],
@@ -603,9 +603,11 @@ for raw_json in bronze_lines:
 
     # only reached if not quarantined
     candidates.append(fixed)
+ survivors, dups_meta = deduplicate(candidates, policy=dedup_policy)
+ return survivors, dups_meta, rejected
 
 
-def compute_fingerprint(row) #To detect conflicting measurements in duplicated records, hash the analytical fields (provenance excluding) and act based on policies
+def compute_fingerprint(row: dict) -> str: #To detect conflicting measurements in duplicated records, hash the analytical fields (provenance excluding) and act based on policies
  FINGERPRINT_FIELDS = (
     # Temperatures
     "temp_c",
@@ -642,8 +644,16 @@ def compute_fingerprint(row) #To detect conflicting measurements in duplicated r
 )
  content = {f : row.get(f) for f in FINGERPRINT_FIELDS}#dictionary comprehension to retrieve all analytical fields (provenance excusive)
  blob = json.dumps(content, sort_keys=True, separators=(",",":")) #Lays it all out as one single line, seperators are changed so that there is no spaces, its as compact as it gets
- return sha256(blob.encode("utf-8")).hexdigest()
+ return hashlib.sha256(blob.encode("utf-8")).hexdigest()
  
+def policy_key(row: dict): #Function takes in a row, retuns tuple of values that define how to rank that row against other duplicates
+  return ( 
+    row["ingested_at_utc"],
+    row["checksum_sha256"],
+    row["bronze_object_key"],
+    row["event_id"],
+  )
+
 
 def deduplicate(rows, *, policy="last_write_wins", fingerprint_fields=None) -> tuple[list[dict], list[dict]]:
  """
@@ -671,16 +681,59 @@ def deduplicate(rows, *, policy="last_write_wins", fingerprint_fields=None) -> t
   - Caller must define and document the tiebreaker used (e.g., bronze key or
     manifest timestamp) and keep it consistent across runs.
  """
- groups : defaultdict(list)
+ survivors: list[dict] = []
+ dups_meta: list[dict] = []
+ groups: dict[tuple[int, datetime], list[dict]] = defaultdict(list)
  for row in rows: 
   key = (row["city_id"], row["event_ts_utc"]) #gives you a tuple of city_id and event_ts_utc, this checks for duplicates
   groups[key].append(row) #assign keys (given by variable above) and append that row
 
- for key, item in groups.items():
-#To finish
+ for key, row in groups.items():
+  if len(row) == 1:
+   survivors.append(row[0])
+   continue
+  
+  pairs = [(r, compute_fingerprint(r)) for r in row] #List comprehension, stored as a tuple, iterate through row, store r (original row), as well as its computed hash counterpart
+  unique_fps = {fp for _, fp in pairs} #Finds 'unique' fingerprints, if a group of 3 produces all same 3 fingerprint, then there is 1 unique finger print
+  survivor = max(row, key=policy_key) #Checks for last writes, key in this scenario passes each element (i.e row) through policy key, combs through the tuples in policy_rank and outputs whichever is the highest
+  #Notice how policy_key gives us a list of tuples. Comparisons are made with the first correlating field (a1, b1 : a tuple, b tuple) and evaluation stops at the first true condition
+  #Key tells us what values to compare, in this case the list of tuples
+
+  if len(unique_fps) == 1:
+   #Identical rows
+   survivors.append(survivor)
+   for r in row:
+    if r is not survivor:
+      dups_meta.append({
+        "key": (key[0], key[1].isoformat()),
+        "survivor_event_id": survivor["event_id"],
+        "dropped_event_id": r["event_id"],
+        "reason": "identical",
+        "policy": "last_write_wins",
+      })
+
+  else:
+    flags = set(filter(None, (survivor.get("quality_flags") or "").split(";")))
+    flags.add("duplicate_conflict")
+    survivor["quality_flags"] = ";".join(sorted(flags))
+    survivor["conflict"] = True
+    survivors.append(survivor)
+
+    for r in row:
+      if r is not survivor:
+        dups_meta.append({
+        "key": (key[0], key[1].isoformat()),
+        "survivor_event_id": survivor["event_id"],
+        "dropped_event_id": r["event_id"],
+        "reason": "conflict",
+        "policy": "last_write_wins",
+        })
+ return survivors, dups_meta
+
+
   
 
-"""""
+"""
 End-to-end orchestration for promoting Bronze → Silver for one city-date.
 
 Args:
