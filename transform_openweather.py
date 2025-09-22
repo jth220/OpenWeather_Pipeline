@@ -1,13 +1,26 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import hashlib
 import json
 from json import JSONDecodeError
 from collections import defaultdict
+import gzip
+from typing import Tuple, List, Dict
+import boto3
+from botocore.exceptions import ClientError
+import argparse
+import sys
+import os
+from dotenv import load_dotenv
+load_dotenv("settings.env")
 
 
-
-
-
+OWM_API_KEY = os.environ["OWM_API_KEY"]
+CITY_NAME = os.environ.get("CITY_NAME", "London")
+MAX_PAYLOAD_BYTES = int(os.environ.get("MAX_PAYLOAD_BYTES","5242880"))
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+BRONZE_BUCKET= os.environ.get("BRONZE_BUCKET")
+QUARANTINE_BUCKET=os.environ.get("QUARANTINE_BUCKET")
 
 
 """
@@ -102,53 +115,130 @@ Relies on environment variables for buckets/regions. No secrets are logged.
 """
 
 
+def list_bronze_keys(city_slug: str, date_utc: date) -> list[str]:
+ """
+ List Bronze JSONL object keys for a given city and UTC date.
 
-"""
-List Bronze JSONL object keys for a given city and UTC date.
-
-Args:
+ Args:
   city_slug (str): Canonical slug for the city (e.g., "london").
   date_utc (datetime.date): Target UTC calendar date to scan under Bronze.
 
-Returns:
+ Returns:
   list[str]: Fully qualified object keys (relative to the Bronze bucket)
              that end with ".jsonl" for the specified city/date. The list
              may be empty if no data is present.
 
-Raises:
+ Raises:
   RuntimeError: On storage access errors (list operation failure).
 
-Notes:
+ Notes:
   - This function performs discovery only (no reads); it may paginate under
     the hood.
   - If hour-level partitioning exists in Bronze, keys will span multiple
     hour subdirectories.
   - Caller decides whether to further filter by hour(s).
-"""
+ """
+ bucket = BRONZE_BUCKET
+ prefix_base = f"weather/city={city_slug}/date={date_utc.isoformat()}" #establishes parameters for prefixes
+ client = boto3.client('s3', 
+                      aws_access_key_id = AWS_ACCESS_KEY_ID,
+                      aws_secret_access_key = AWS_SECRET_ACCESS_KEY,
+                      region_name = "eu-north-1",
+                      )
+
+ keys: list[str] = []
+ try:
+        for hour in range(24):
+            hour_prefix = f"{prefix_base}/hour={hour:02d}/" #padded with two digits
+            paginator = client.get_paginator("list_objects_v2") #paginator is an iterator over pages of results
+            for page in paginator.paginate(Bucket=bucket, Prefix=hour_prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"] #Iterate through page contents
+                    if key.endswith(".jsonl"):
+                        keys.append(key) #Append key ()
+ except ClientError as e:
+        raise RuntimeError(f"S3 list failed: {e}")
+
+ return keys
 
 
-"""
-Read a Bronze JSONL object and return parsed payloads.
+def read_bronze_jsonl(object_key: str) -> Tuple[List[Dict], str]:
+ """
+ Read a Bronze JSONL object and return parsed payloads.
 
-Args:
+ Args:
   object_key (str): Bronze object key previously discovered.
 
-Returns:
+ Returns:
   tuple[list[dict], str]:
     - payloads: List of dicts parsed from each non-empty line in the object.
     - checksum_sha256: Hex digest of the raw object bytes, used for provenance.
 
-Raises:
+ Raises:
   RuntimeError: If the object cannot be fetched or parsed.
   ValueError: If a line is not valid JSON.
 
-Idempotency:
+ Idempotency:
   - Pure read. Does not mutate storage.
 
-Observability:
+ Observability:
   - The returned checksum is used to verify integrity and assist dedup.
-"""
+ """
+ client = boto3.client('s3', 
+                      aws_access_key_id = AWS_ACCESS_KEY_ID,
+                      aws_secret_access_key = AWS_SECRET_ACCESS_KEY,
+                      region_name = "eu-north-1",
+                      )
 
+ # --- 1) Fetch raw bytes from S3 ---
+ try:
+        resp = client.get_object(Bucket=BRONZE_BUCKET, Key=object_key)
+        body = resp["Body"].read()  # bytes
+ except ClientError as e:
+        raise RuntimeError(f"Failed to fetch s3://{BRONZE_BUCKET}/{object_key}: {e}")
+
+ # --- 2) Compute checksum of RAW bytes (compressed if stored compressed) ---
+ checksum = hashlib.sha256(body).hexdigest()
+
+ # --- 3) Decompress if needed (prefer ContentEncoding; fallback by extension) ---
+ content_encoding = (resp.get("ContentEncoding") or "").lower()
+ is_gzip = content_encoding == "gzip" or object_key.endswith(".gz")
+ if is_gzip:
+        try:
+            body = gzip.decompress(body)
+        except OSError as e:
+            raise RuntimeError(
+                f"Object appears gzip-encoded but could not be decompressed: {e}"
+            )
+
+ # --- 4) Decode to text (UTF-8) ---
+ try:
+        text = body.decode("utf-8")
+ except UnicodeDecodeError as e:
+        raise RuntimeError(f"UTF-8 decode failed for {object_key}: {e}")
+
+ # --- 5) Parse JSON Lines ---
+ payloads: List[Dict] = []
+ for i, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue  # skip blank lines
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            # Include line number and a short preview to aid debugging.
+            preview = (line[:120] + "…") if len(line) > 120 else line
+            raise ValueError(
+                f"Invalid JSON at line {i} in {object_key}: {e.msg}. Line preview: {preview}"
+            )
+        if not isinstance(obj, dict):
+            # If you expect only dicts, enforce it. Remove this if arrays/values are valid for your pipeline.
+            raise ValueError(
+                f"Expected a JSON object at line {i} in {object_key}, got {type(obj).__name__}."
+            )
+        payloads.append(obj)
+
+ return payloads, checksum
 
 def normalize(payload, *, city_slug, bronze_object_key, checksum_sha256):
  """
@@ -254,7 +344,7 @@ def normalize(payload, *, city_slug, bronze_object_key, checksum_sha256):
     "city_name": city_name,
     "event_ts_utc": ts_utc,
     "ingested_at_utc": datetime.now(timezone.utc),
-    "bronze_object_key": bronze_key,
+    "bronze_object_key": bronze_object_key,
     "checksum_sha256": checksum_sha256,
     "source": "openweather",
 
@@ -459,6 +549,7 @@ def validate(row):
  fixed["quality_flags"] = ";".join(flags) if flags else ""
  return fixed, flags, "pass"
 
+#to add a quarantine
 """
 Persist an invalid or rejected record into a quarantine area for audit.
 
@@ -492,7 +583,7 @@ Notes:
 """
 
 
-def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_key:str , checksum_sha256:str , dedup_policy:str) -> tuple[list[dict], list[dict], list[dict]]:
+def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_object_key:str , checksum_sha256:str , dedup_policy:str) -> tuple[list[dict], list[dict], list[dict]]:
  """
     Orchestrate a micro-batch from Bronze → Silver:
       JSONL lines (raw provider payloads) → normalize → validate → deduplicate.
@@ -568,7 +659,7 @@ def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_key:str ,
             "reason": "malformed_json",
             "flags": [],
             "payload_raw": raw_json,
-            "bronze_object_key": bronze_key,
+            "bronze_object_key": bronze_object_key,
             "checksum_sha256": checksum_sha256,
         })
         continue  # skip to next line
@@ -577,7 +668,7 @@ def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_key:str ,
     row = normalize(
         payload,
         city_slug=city_slug,
-        bronze_key=bronze_key,
+        bronze_object_key=bronze_object_key,
         checksum_sha256=checksum_sha256,
     )
     if row is None:
@@ -585,7 +676,7 @@ def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_key:str ,
             "reason": "missing_natural_key",
             "flags": [],
             "payload_raw": payload,  # inspect parsed payload
-            "bronze_object_key": bronze_key,
+            "bronze_object_key": bronze_object_key,
             "checksum_sha256": checksum_sha256,
         })
         continue
@@ -596,7 +687,7 @@ def process_microbatch(bronze_lines: list[str], city_slug:str , bronze_key:str ,
             "reason": "validation_failed",
             "flags": flags,
             "payload_raw": row,  # inspect normalized row
-            "bronze_object_key": bronze_key,
+            "bronze_object_key": bronze_object_key,
             "checksum_sha256": checksum_sha256,
         })
         continue
@@ -733,60 +824,121 @@ def deduplicate(rows, *, policy="last_write_wins", fingerprint_fields=None) -> t
 
   
 
-"""
-End-to-end orchestration for promoting Bronze → Silver for one city-date.
+def run(city_slug: str, target_date_utc: "datetime.date") -> dict:
+    """
+    End-to-end orchestration for promoting Bronze → Silver for one city-date.
+    """
+    date_str = target_date_utc.isoformat()
 
-Args:
-  city_slug (str): Canonical city slug (e.g., "london").
-  target_date_utc (datetime.date): UTC calendar date to process.
+    # 1) Discover Bronze keys
+    try:
+        bronze_object_keys = list_bronze_keys(city_slug, target_date_utc)
+    except Exception as e:
+        raise RuntimeError(f"Failed to list Bronze keys for {city_slug} {date_str}: {e}")
 
-Returns:
-  dict: Pipeline report:
-        {
-          "city_slug": str,
-          "date_utc": "YYYY-MM-DD",
-          "bronze_objects": int,
-          "raw_records": int,
-          "normalized": int,
-          "quarantined": int,
-          "validated_pass": int,
-          "deduped": int,
-          "written_rows": int,
-          "partitions": int,
-          "quarantine_rate": float,  # 0.0-1.0
-          "policy": { "dedup": "last", "partitioning": "date|date_hour" }
-        }
+    counters = defaultdict(int)
+    counters["city_slug"] = city_slug
+    counters["date_utc"] = date_str
+    counters["bronze_objects"] = 0
+    counters["raw_records"] = 0
+    counters["normalized"] = 0
+    counters["quarantined"] = 0
+    counters["validated_pass"] = 0
+    counters["deduped"] = 0
+    counters["written_rows"] = 0
+    counters["partitions"] = 0
 
-Raises:
-  RuntimeError: On unrecoverable I/O or write failures.
+    all_survivors: List[Dict] = []
+    all_dups_meta: List[Dict] = []
+    all_rejected: List[Dict] = []
 
-Flow:
-  1) Discover Bronze object keys for (city_slug, date_utc).
-  2) For each key:
-       - Read JSONL → payloads, compute checksum.
-       - Normalize each payload to a row (or quarantine if missing keys).
-       - Validate each row → pass or quarantine.
-  3) Deduplicate passing rows by (city_id, event_ts_utc) using policy.
-  4) Write Silver partitions; collect paths and counts.
-  5) Compute and return the report (and optionally enforce a guardrail:
-     fail if quarantine_rate > threshold).
+    # 2) For each Bronze object: read → process microbatch
+    for key in sorted(bronze_object_keys):
+        try:
+            payloads, checksum = read_bronze_jsonl(key)  # returns list[dict], checksum
+        except Exception as e:
+            raise RuntimeError(f"Failed to read Bronze object '{key}': {e}")
 
-Idempotency:
-  - Safe to re-run for the same city/date; results should converge.
+        counters["bronze_objects"] += 1
+        counters["raw_records"] += len(payloads)
 
-Guardrails:
-  - Optionally raise if quarantine_rate exceeds configured threshold.
-"""
+        # process_microbatch expects raw JSON lines; re-serialize parsed payloads
+        bronze_lines = [json.dumps(p, separators=(",", ":")) for p in payloads]
 
-"""
-CLI entrypoint for manual or scheduled runs.
+        survivors, dups_meta, rejected = process_microbatch(
+            bronze_lines=bronze_lines,
+            city_slug=city_slug,
+            bronze_object_key=key,
+            checksum_sha256=checksum,
+            dedup_policy="last_write_wins",
+        )
 
-Behavior:
-  - Parse environment or CLI args for `city_slug` and `target_date_utc`
-    (default: today's UTC date).
-  - Call `run(...)` and print a concise report.
-  - Exit non-zero on guardrail violations or write failures.
+        # Track normalized count as: raw - malformed_json - missing_natural_key
+        malformed = sum(1 for r in rejected if r.get("reason") == "malformed_json")
+        missing_nk = sum(1 for r in rejected if r.get("reason") == "missing_natural_key")
+        counters["normalized"] += (len(payloads) - malformed - missing_nk)
 
-Notes:
-  - Keep orchestration in `run`; `main` should remain a thin wrapper.
-"""
+        all_survivors.extend(survivors)
+        all_dups_meta.extend(dups_meta)
+        all_rejected.extend(rejected)
+
+    # 3) Aggregated counters post-validation/dedup
+    counters["quarantined"] = len(all_rejected)
+    # Passing before dedup == survivors + dropped duplicates
+    counters["validated_pass"] = len(all_survivors) + len(all_dups_meta)
+    counters["deduped"] = len(all_survivors)
+
+    # 4) (Write Silver partitions) — compute partition groups & counts
+    # If you already have a writer, call it here and set written_rows/partitions from its result.
+    # Below we compute the counts deterministically from survivors as they would land.
+    partition_groups = defaultdict(list)
+    for row in all_survivors:
+        # Default partitioning by date; include hour if present
+        date_part = row.get("date_utc")
+        hour_part = row.get("hour_utc")
+        if date_part is None:
+            # derive from event_ts_utc as a safety net
+            evt = row.get("event_ts_utc")
+            if isinstance(evt, datetime):
+                date_part = evt.date().isoformat()
+                hour_part = evt.hour
+        part_key = (date_part, hour_part)  # ('YYYY-MM-DD', 0-23 or None)
+        partition_groups[part_key].append(row)
+
+    # Optionally: write each partition here (e.g., to Parquet) and set written_rows accordingly.
+    # For now, we mirror the final counts the writer would produce:
+    counters["written_rows"] = sum(len(rows) for rows in partition_groups.values())
+    counters["partitions"] = len(partition_groups)
+
+    # 5) Guardrail (optional via env var QUARANTINE_RATE_MAX)
+    q_rate_max_env = os.environ.get("QUARANTINE_RATE_MAX")
+    quarantine_rate_max = float(q_rate_max_env) if q_rate_max_env else None
+    quarantine_rate = (counters["quarantined"] / counters["raw_records"]) if counters["raw_records"] else 0.0
+
+    if quarantine_rate_max is not None and quarantine_rate > quarantine_rate_max:
+        # To add persist quarantine payloads here if your sink
+        # (e.g., write to QUARANTINE_BUCKET) before raising.
+        raise RuntimeError(
+            f"Guardrail: quarantine_rate {quarantine_rate:.3f} exceeded max {quarantine_rate_max:.3f} "
+            f"for {city_slug} {date_str}"
+        )
+
+    report = {
+        "city_slug": city_slug,
+        "date_utc": date_str,
+        "bronze_objects": int(counters["bronze_objects"]),
+        "raw_records": int(counters["raw_records"]),
+        "normalized": int(counters["normalized"]),
+        "quarantined": int(counters["quarantined"]),
+        "validated_pass": int(counters["validated_pass"]),
+        "deduped": int(counters["deduped"]),
+        "written_rows": int(counters["written_rows"]),
+        "partitions": int(counters["partitions"]),
+        "quarantine_rate": float(quarantine_rate),
+        "policy": {"dedup": "last_write_wins", "partitioning": "date|date_hour"},
+    }
+    return report
+
+
+report = run("london", date(2025, 9, 4))
+print(report)
