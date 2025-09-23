@@ -12,6 +12,11 @@ import sys
 import os
 from dotenv import load_dotenv
 load_dotenv("settings.env")
+import hashlib
+import pandas as _pd
+import pyarrow as _pa
+import pyarrow.parquet as _pq
+import pyarrow.fs as _pafs
 
 
 OWM_API_KEY = os.environ["OWM_API_KEY"]
@@ -20,6 +25,7 @@ MAX_PAYLOAD_BYTES = int(os.environ.get("MAX_PAYLOAD_BYTES","5242880"))
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 BRONZE_BUCKET= os.environ.get("BRONZE_BUCKET")
+SILVER_BUCKET= os.environ.get("SILVER_BUCKET")
 QUARANTINE_BUCKET=os.environ.get("QUARANTINE_BUCKET")
 
 
@@ -821,8 +827,93 @@ def deduplicate(rows, *, policy="last_write_wins", fingerprint_fields=None) -> t
         })
  return survivors, dups_meta
 
+def _rows_to_table(_rows: list[dict]) -> _pa.Table:
+    df = _pd.DataFrame(_rows)
+    for col in ("event_ts_utc", "ingested_at_utc"):
+        if col in df.columns:
+            df[col] = _pd.to_datetime(df[col], utc=True, errors="coerce")
+    return _pa.Table.from_pandas(df, preserve_index=False)
 
-  
+def _stable_run_id(_rows: list[dict]) -> str:
+    evs = sorted(str(r.get("event_id")) for r in _rows if r.get("event_id"))
+    return hashlib.sha1(("\n".join(evs)).encode("utf-8")).hexdigest()[:16]
+
+def write_silver(
+    survivors: list[dict],
+    *,
+    bucket: str,
+    base_prefix: str = "weather",
+    s3_region: str | None = None,
+    compression: str = "snappy",
+    with_manifest: bool = True,
+) -> dict:
+    """
+    Write survivors to S3 as Parquet.
+    Partitions:
+      - always date_utc=YYYY-MM-DD
+      - hour_utc=HH if present
+      - city_slug=<slug>
+    Returns: {"written_keys": [...], "manifest_keys": [...], "run_id": "..."}
+    """
+    if not survivors:
+        return {"written_keys": [], "manifest_keys": [], "run_id": None}
+
+    use_hour = any(r.get("hour_utc") is not None for r in survivors)
+    groups: dict[tuple[str, int | None, str], list[dict]] = defaultdict(list)
+    for r in survivors:
+        d = r.get("date_utc")
+        c = r.get("city_slug")
+        if not d or not c:
+            raise RuntimeError(f"Row missing partition fields: {r}")
+        h = int(r["hour_utc"]) if use_hour and (r.get("hour_utc") is not None) else None
+        groups[(d, h, c)].append(r)
+
+    fs = _pafs.S3FileSystem(region=s3_region) if s3_region else _pafs.S3FileSystem()
+    run_id = _stable_run_id(survivors)
+    written: list[str] = []
+    seq = 0
+
+    for (d, h, c), rows in sorted(groups.items()):
+        if h is None:
+            part_dir = f"{base_prefix}/date_utc={d}/city_slug={c}"
+        else:
+            part_dir = f"{base_prefix}/date_utc={d}/hour_utc={h:02d}/city_slug={c}"
+        file_key = f"{part_dir}/part-{run_id}-{seq:05d}.parquet"
+        seq += 1
+
+        table = _rows_to_table(rows)
+        uri = f"{bucket}/{file_key}"
+        _pq.write_table(table, where=uri, filesystem=fs, compression=compression)
+        written.append(file_key)
+
+    manifest_keys: list[str] = []
+    if with_manifest:
+        by_date: dict[str, list[str]] = defaultdict(list)
+        for k in written:
+            i = k.find("date_utc="); j = k.find("/", i + 9)
+            by_date[k[i+9:j]].append(k)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for d, keys in by_date.items():
+            mdir = f"{base_prefix}/date_utc={d}/_MANIFEST"
+            mkey = f"{mdir}/run={run_id}.json"
+            muri = f"{bucket}/{mkey}"
+            doc = {
+                "run_id": run_id,
+                "created_at_utc": now_iso,
+                "base_prefix": base_prefix,
+                "date_utc": d,
+                "use_hour_partition": use_hour,
+                "outputs": keys,
+            }
+            payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            with fs.open_output_stream(muri) as out:
+                out.write(payload)
+            manifest_keys.append(mkey)
+
+    return {"written_keys": written, "manifest_keys": manifest_keys, "run_id": run_id}
+
+
 
 def run(city_slug: str, target_date_utc: "datetime.date") -> dict:
     """
@@ -888,27 +979,26 @@ def run(city_slug: str, target_date_utc: "datetime.date") -> dict:
     counters["validated_pass"] = len(all_survivors) + len(all_dups_meta)
     counters["deduped"] = len(all_survivors)
 
-    # 4) (Write Silver partitions) — compute partition groups & counts
-    # If you already have a writer, call it here and set written_rows/partitions from its result.
-    # Below we compute the counts deterministically from survivors as they would land.
-    partition_groups = defaultdict(list)
-    for row in all_survivors:
-        # Default partitioning by date; include hour if present
-        date_part = row.get("date_utc")
-        hour_part = row.get("hour_utc")
-        if date_part is None:
-            # derive from event_ts_utc as a safety net
-            evt = row.get("event_ts_utc")
-            if isinstance(evt, datetime):
-                date_part = evt.date().isoformat()
-                hour_part = evt.hour
-        part_key = (date_part, hour_part)  # ('YYYY-MM-DD', 0-23 or None)
-        partition_groups[part_key].append(row)
-
-    # Optionally: write each partition here (e.g., to Parquet) and set written_rows accordingly.
-    # For now, we mirror the final counts the writer would produce:
-    counters["written_rows"] = sum(len(rows) for rows in partition_groups.values())
-    counters["partitions"] = len(partition_groups)
+    # 4) Write Silver partitions
+    if all_survivors:
+        try:
+            write_result = write_silver(
+                all_survivors,
+                bucket=SILVER_BUCKET,       
+                base_prefix="weather",
+                s3_region="eu-north-1",
+                compression="snappy",
+                with_manifest=True,
+            )
+            counters["written_rows"] = len(all_survivors)
+            counters["partitions"] = len(
+                {(r["date_utc"], r.get("hour_utc"), r["city_slug"]) for r in all_survivors}
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to write Silver rows: {e}")
+    else:
+        counters["written_rows"] = 0
+        counters["partitions"] = 0
 
     # 5) Guardrail (optional via env var QUARANTINE_RATE_MAX)
     q_rate_max_env = os.environ.get("QUARANTINE_RATE_MAX")
