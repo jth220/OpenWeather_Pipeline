@@ -31,53 +31,6 @@ It’s built as a teaching project in cloud data engineering, covering contracts
 
 ---
 
-## ⚙️ Setup
-
-1. **Clone the repo**  
-   ```bash
-   git clone https://github.com/<your-username>/hello-cloud.git
-   cd hello-cloud
-   ```
-
-2. **Create a virtual environment**  
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate   # macOS/Linux
-   .venv\Scripts\activate      # Windows PowerShell
-   ```
-
-3. **Install dependencies**  
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure environment**  
-   Copy the example file:
-   ```bash
-   cp settings.env.example settings.env
-   ```
-   Then edit `settings.env` with your **OpenWeather API key** and other settings.
-
----
-
-## ▶️ Usage
-
-Run the fetcher:
-
-```bash
-python ingest_openweather.py
-```
-
-Example output (logs):
-```
-2025-09-03 14:00:01 INFO attempt=1 city=london status=200 duration_ms=233 result=ok
-```
-
-On success: returns `(payload, base_url, redacted_url, duration)`.  
-On failure: payload is quarantined and function returns `None`.
-
----
-
 ## 🛡️ Safety principles
 
 - **Contracts**: explicit success/failure conditions
@@ -101,4 +54,5 @@ On failure: payload is quarantined and function returns `None`.
 This project is for learning purposes, but PRs and issues are welcome.  
 
 ---
+
 
