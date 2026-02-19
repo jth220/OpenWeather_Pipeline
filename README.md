@@ -1,58 +1,38 @@
-# 🌦️ Hello Cloud – OpenWeather Ingestion Pipeline
+# OpenWeather Ingestion Pipeline
 
-This repo is a minimal **cloud-native ingestion system** that fetches data from the [OpenWeather API](https://openweathermap.org/current), applies safety checks, and lands raw events in a **Bronze object store layout**.
+Minimal cloud-oriented ingestion script that retrieves current weather data from the OpenWeather API, performs validation and safety checks, and stores raw events in a Bronze-style object layout.
 
-It’s built as a teaching project in cloud data engineering, covering contracts, retries, quarantine, and idempotent storage.
+This repository serves as a reference implementation for ingestion reliability, idempotent storage, and structured observability within a simple data pipeline.
 
----
+## Functionality
 
-## 🚀 Features
+- Fetches current weather data for a configured city
+- Retries failed requests using exponential backoff (e.g., rate limits, server errors, network failures)
+- Applies connection and read timeouts
+- Quarantines malformed, oversized, or client-error payloads
+- Produces structured logs with secret redaction
+- Generates deterministic event identifiers (`city_id + dt → SHA1`)
+- Partitions Bronze data by city, date, and hour
 
-- Fetches current weather for a configured city
-- **Retries with exponential backoff** (handles 429, 5xx, network errors)
-- **Timeouts** for connect + read
-- **Quarantine** of malformed/oversized payloads or client errors
-- **Structured logging** with secret redaction
-- Deterministic **event IDs** (`city_id + dt → SHA1 hex`)
-- Bronze partitioning by `city` / `date` / `hour`
+## Repository Structure
 
----
-
-## 📂 Repo structure
-
-```
 .
-├── ingest_openweather.py   # main fetcher
-├── settings.env.example    # sample config (copy → settings.env with real values)
-├── .gitignore              # ignore venv, secrets, caches
-├── requirements.txt        # Python dependencies
-└── README.md               # this file
-```
+├── ingest_openweather.py  
+├── settings.env.example  
+├── .gitignore  
+├── requirements.txt  
+└── README.md  
 
----
+## Design Principles
 
-## 🛡️ Safety principles
+- Explicit success and failure handling
+- Idempotent event storage
+- Observable execution through structured logging
+- Environment-driven configuration and secret management
 
-- **Contracts**: explicit success/failure conditions
-- **Idempotency**: same input → same event_id + path
-- **Observability**: logs make pipeline a glass box, not a black box
-- **Cloud hygiene**: redact secrets, send polite headers, env-driven config
+## Planned Extensions
 
----
-
-## 🔮 Roadmap
-
-- [ ] Implement Bronze object writer (`write_bronze_line`)
-- [ ] Add manifest JSON alongside each Bronze write
-- [ ] Wire into Prefect for orchestration
-- [ ] Terraform scripts for infra (buckets, queues)
-
----
-
-## 🤝 Contributing
-
-This project is for learning purposes, but PRs and issues are welcome.  
-
----
-
-
+- Bronze object writer implementation
+- Manifest metadata alongside stored events
+- Workflow orchestration integration
+- Infrastructure provisioning scripts
